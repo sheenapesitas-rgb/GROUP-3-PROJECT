@@ -1,0 +1,433 @@
+"""
+Basic Image Processing Editor & Animator  (Python 3.10+)
+---------------------------------------------------------
+Tab 1 – Image Editor : Pillow (open/save/crop/resize/rotate) + Tkinter mouse events
+Tab 2 – Sprite Tester: pygame double-buffered animation embedded in Tkinter,
+                       click canvas to pause/play, slider to change FPS
+
+Dependencies:
+    pip install Pillow pygame
+"""
+
+import os
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+from PIL import Image, ImageTk          # image processing (Pillow)
+import pygame                            # animation / double buffering
+
+
+# ---------------------------------------------------------------------------
+# 1. IMAGE EDITOR TAB
+# ---------------------------------------------------------------------------
+class ImageEditorTab(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master, padding=8)
+        self.original_image = None      # PIL.Image
+        self.current_image  = None      # PIL.Image
+        self.tk_image       = None      # ImageTk.PhotoImage (keep reference!)
+        self.crop_start     = None
+        self.crop_rect_id   = None
+        self._crop_box      = None      # (x1,y1,x2,y2) in canvas coords
+        self._render_info   = (0, 0, 1.0)
+        self._build_ui()
+
+    def _build_ui(self):
+        toolbar = ttk.Frame(self)
+        toolbar.pack(side="top", fill="x", pady=(0, 6))
+
+        ttk.Button(toolbar, text="Open Image", command=self.open_image).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Save As",    command=self.save_image).pack(side="left", padx=2)
+        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(toolbar, text="Resize…",     command=self.resize_image).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Rotate 90°",  command=lambda: self.rotate_image(90)).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Rotate -90°", command=lambda: self.rotate_image(-90)).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Crop",        command=self.apply_crop).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="Reset",       command=self.reset_image).pack(side="left", padx=2)
+
+        self.canvas = tk.Canvas(self, bg="#2b2b2b", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<ButtonPress-1>",   self._on_mouse_down)
+        self.canvas.bind("<B1-Motion>",       self._on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
+        self.canvas.bind("<Configure>",       lambda e: self._render())
+
+        self.status = tk.StringVar(value="Open an image, then drag on the canvas to select a crop area.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(6, 0))
+
+    # ---------------- file I/O ----------------
+    def open_image(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff")])
+        if not path:
+            return
+        try:
+            self.original_image = Image.open(path).convert("RGBA")
+            self.current_image  = self.original_image.copy()
+            self._render()
+            w, h = self.current_image.size
+            self.status.set(f"Loaded: {os.path.basename(path)} ({w}×{h})")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open image:\n{e}")
+
+    def save_image(self):
+        if self.current_image is None:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")])
+        if not path:
+            return
+        try:
+            img = self.current_image
+            if path.lower().endswith((".jpg", ".jpeg")):
+                img = img.convert("RGB")
+            img.save(path)
+            self.status.set(f"Saved: {path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save:\n{e}")
+
+    # ---------------- transforms ----------------
+    def resize_image(self):
+        if self.current_image is None:
+            return
+        dlg = ResizeDialog(self, *self.current_image.size)
+        if dlg.result:
+            w, h = dlg.result
+            self.current_image = self.current_image.resize((w, h), Image.LANCZOS)
+            self._crop_box = None
+            self._render()
+            self.status.set(f"Resized to {w}×{h}")
+
+    def rotate_image(self, angle):
+        if self.current_image is None:
+            return
+        self.current_image = self.current_image.rotate(angle, expand=True)
+        self._crop_box = None
+        self._render()
+        self.status.set(f"Rotated {angle}°")
+
+    def reset_image(self):
+        if self.original_image is None:
+            return
+        self.current_image = self.original_image.copy()
+        self._crop_box = None
+        self._render()
+        self.status.set("Reverted to original image.")
+
+    def apply_crop(self):
+        if self.current_image is None or self._crop_box is None:
+            self.status.set("Drag a rectangle on the image first, then press Crop.")
+            return
+        ox, oy, scale = self._render_info
+        x1, y1, x2, y2 = self._crop_box
+        iw, ih = self.current_image.size
+        ix1 = max(0, int((x1 - ox) / scale))
+        iy1 = max(0, int((y1 - oy) / scale))
+        ix2 = min(iw, int((x2 - ox) / scale))
+        iy2 = min(ih, int((y2 - oy) / scale))
+        if ix2 - ix1 < 1 or iy2 - iy1 < 1:
+            self.status.set("Crop selection is outside the image.")
+            return
+        self.current_image = self.current_image.crop((ix1, iy1, ix2, iy2))
+        self._crop_box = None
+        self._render()
+        self.status.set(f"Cropped to {ix2 - ix1}×{iy2 - iy1}")
+
+    # ---------------- rendering ----------------
+    def _render(self):
+        self.canvas.delete("all")
+        if self.current_image is None:
+            return
+        cw, ch = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        iw, ih = self.current_image.size
+        scale = min(cw / iw, ch / ih, 1.0) or 1.0
+        dw, dh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        ox, oy = (cw - dw) // 2, (ch - dh) // 2
+
+        view = self.current_image.resize((dw, dh), Image.LANCZOS)
+        self.tk_image = ImageTk.PhotoImage(view)
+        self.canvas.create_image(ox, oy, anchor="nw", image=self.tk_image)
+        self._render_info = (ox, oy, scale)
+
+    # ---------------- mouse events ----------------
+    def _on_mouse_down(self, e):
+        if self.current_image is None:
+            return
+        self.crop_start = (e.x, e.y)
+        if self.crop_rect_id:
+            self.canvas.delete(self.crop_rect_id)
+        self.crop_rect_id = self.canvas.create_rectangle(
+            e.x, e.y, e.x, e.y, outline="#00e0ff", width=2, dash=(4, 2))
+
+    def _on_mouse_drag(self, e):
+        if self.crop_start is None:
+            return
+        x0, y0 = self.crop_start
+        self.canvas.coords(self.crop_rect_id, x0, y0, e.x, e.y)
+
+    def _on_mouse_up(self, e):
+        if self.crop_start is None:
+            return
+        x0, y0 = self.crop_start
+        x1, y1 = e.x, e.y
+        self._crop_box = (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        self.crop_start = None
+        self.status.set(
+            f"Selection {self._crop_box[2]-self._crop_box[0]}×"
+            f"{self._crop_box[3]-self._crop_box[1]} px — press Crop")
+
+
+# ---------------------------------------------------------------------------
+# 2. RESIZE DIALOG
+# ---------------------------------------------------------------------------
+class ResizeDialog(tk.Toplevel):
+    def __init__(self, master, w, h):
+        super().__init__(master)
+        self.title("Resize Image")
+        self.resizable(False, False)
+        self.result = None
+
+        ttk.Label(self, text="Width:").grid(row=0, column=0, padx=6, pady=6, sticky="e")
+        self.w_var = tk.IntVar(value=w)
+        ttk.Spinbox(self, from_=1, to=10000, textvariable=self.w_var, width=8).grid(row=0, column=1)
+
+        ttk.Label(self, text="Height:").grid(row=1, column=0, padx=6, pady=6, sticky="e")
+        self.h_var = tk.IntVar(value=h)
+        ttk.Spinbox(self, from_=1, to=10000, textvariable=self.h_var, width=8).grid(row=1, column=1)
+
+        btns = ttk.Frame(self); btns.grid(row=2, column=0, columnspan=2, pady=8)
+        ttk.Button(btns, text="OK",     command=self._ok).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+        self.transient(master); self.grab_set()
+        self.wait_window(self)
+
+    def _ok(self):
+        try:
+            w, h = int(self.w_var.get()), int(self.h_var.get())
+            if w > 0 and h > 0:
+                self.result = (w, h)
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# 3. SPRITE ANIMATOR TAB  (uses pygame double buffering)
+# ---------------------------------------------------------------------------
+class SpriteAnimatorTab(ttk.Frame):
+    """
+    A small pygame window is embedded inside a Tk frame.
+    - Sprite-sheet is sliced into individual pygame Surfaces.
+    - Animation is drawn on the pygame back buffer and flipped (double buffering).
+    - Mouse click on the pygame window toggles play/pause.
+    - Slider changes FPS in real time.
+    """
+
+    def __init__(self, master):
+        super().__init__(master, padding=8)
+        self.sheet_path   = None
+        self.frames       = []          # list[pygame.Surface]
+        self.frame_idx    = 0
+        self.fps          = 10
+        self.playing      = True
+        self._last_frame_time = 0.0
+        self._pygame_ready = False
+        self.screen       = None
+        self._font        = None
+        self._build_ui()
+
+    # ---------------- UI ----------------
+    def _build_ui(self):
+        bar = ttk.Frame(self)
+        bar.pack(side="top", fill="x", pady=(0, 6))
+
+        ttk.Button(bar, text="Load Sprite Sheet", command=self.load_sheet).pack(side="left", padx=2)
+        ttk.Label(bar, text="Frame W:").pack(side="left", padx=(10, 2))
+        self.fw_var = tk.IntVar(value=64)
+        ttk.Spinbox(bar, from_=8, to=1024, textvariable=self.fw_var, width=6).pack(side="left")
+        ttk.Label(bar, text="Frame H:").pack(side="left", padx=(10, 2))
+        self.fh_var = tk.IntVar(value=64)
+        ttk.Spinbox(bar, from_=8, to=1024, textvariable=self.fh_var, width=6).pack(side="left")
+        ttk.Button(bar, text="Slice & Play", command=self.slice_sheet).pack(side="left", padx=8)
+
+        # Placeholder frame; we create an embedded pygame window after Tk is idle
+        self.embed_frame = tk.Frame(self, bg="#1a1a1a")
+        self.embed_frame.pack(fill="both", expand=True)
+        self.embed_frame.bind("<Configure>", self._on_resize)
+
+        ctrl = ttk.Frame(self)
+        ctrl.pack(fill="x", pady=(6, 0))
+        ttk.Label(ctrl, text="Playback speed (FPS):").pack(side="left")
+        self.fps_scale = ttk.Scale(ctrl, from_=1, to=60, orient="horizontal",
+                                   command=self._on_fps_change)
+        self.fps_scale.set(self.fps)
+        self.fps_scale.pack(side="left", fill="x", expand=True, padx=6)
+        self.fps_lbl = ttk.Label(ctrl, text=f"{self.fps} fps", width=8)
+        self.fps_lbl.pack(side="left")
+        self.state_lbl = ttk.Label(ctrl, text="Playing", foreground="#2ecc71")
+        self.state_lbl.pack(side="left", padx=12)
+
+        self.status = tk.StringVar(
+            value="Load a sprite sheet, set frame size, then click 'Slice & Play'.")
+        ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", pady=(6, 0))
+
+        # Give Tk a moment to map the window, then create the pygame surface
+        self.after(100, self._init_pygame)
+
+    # ---------------- pygame embedding ----------------
+    def _init_pygame(self):
+        if self._pygame_ready:
+            return
+        try:
+            self.embed_frame.update_idletasks()
+            os.environ["SDL_WINDOWID"] = str(self.embed_frame.winfo_id())
+            os.environ.setdefault("SDL_VIDEODRIVER", "windib" if os.name == "nt" else "x11")
+            pygame.display.init()
+            pygame.font.init()
+            w = max(320, self.embed_frame.winfo_width())
+            h = max(240, self.embed_frame.winfo_height())
+            self.screen = pygame.display.set_mode((w, h))
+            pygame.display.set_caption("Sprite Animator (pygame)")
+            self._font = pygame.font.SysFont("Arial", 14)
+            self._pygame_ready = True
+            self._start_loop()
+        except Exception as e:
+            self._pygame_ready = False
+            self.status.set(f"pygame embedding failed ({e}); using Pillow fallback.")
+
+    def _on_resize(self, event):
+        if self._pygame_ready and self.screen is not None:
+            try:
+                self.screen = pygame.display.set_mode(
+                    (max(320, event.width), max(240, event.height)))
+            except Exception:
+                pass
+
+    # ---------------- loading & slicing ----------------
+    def load_sheet(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp")])
+        if not path:
+            return
+        self.sheet_path = path
+        self.status.set(f"Loaded sheet: {os.path.basename(path)}")
+
+    def slice_sheet(self):
+        if not self.sheet_path:
+            self.status.set("Load a sprite sheet first.")
+            return
+        try:
+            fw, fh = int(self.fw_var.get()), int(self.fh_var.get())
+            sheet = pygame.image.load(self.sheet_path).convert_alpha()
+            sw, sh = sheet.get_size()
+            cols, rows = sw // fw, sh // fh
+            frames = []
+            for r in range(rows):
+                for c in range(cols):
+                    rect = pygame.Rect(c * fw, r * fh, fw, fh)
+                    frames.append(sheet.subsurface(rect).copy())
+            if not frames:
+                self.status.set("Frame size is larger than the sprite sheet.")
+                return
+            self.frames = frames
+            self.frame_idx = 0
+            self.status.set(f"Sliced {len(frames)} frames ({cols}×{rows}). "
+                            f"Click the pygame window to pause/play.")
+        except Exception as e:
+            messagebox.showerror("Slice error", str(e))
+
+    # ---------------- main loop ----------------
+    def _start_loop(self):
+        if not self._pygame_ready:
+            return
+        self._last_frame_time = time.time()
+        self._loop()
+
+    def _loop(self):
+        if not self._pygame_ready or not self.winfo_exists():
+            return
+        try:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    self._pygame_ready = False
+                    return
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self.playing = not self.playing
+                    self.state_lbl.config(
+                        text="Playing" if self.playing else "Paused",
+                        foreground="#2ecc71" if self.playing else "#e67e22")
+
+            # --- animation timing ---
+            now = time.time()
+            if self.playing and self.frames:
+                interval = 1.0 / max(1, self.fps)
+                if now - self._last_frame_time >= interval:
+                    self._last_frame_time = now
+                    self.frame_idx = (self.frame_idx + 1) % len(self.frames)
+
+            # --- DRAW to back buffer (double buffering) ---
+            self.screen.fill((20, 20, 20))
+            if self.frames:
+                frame = self.frames[self.frame_idx]
+                sw, sh = self.screen.get_size()
+                fw, fh = frame.get_size()
+                scale = min(sw / fw, sh / fh)
+                dw, dh = max(1, int(fw * scale)), max(1, int(fh * scale))
+                scaled = pygame.transform.scale(frame, (dw, dh))
+                self.screen.blit(scaled, ((sw - dw) // 2, (sh - dh) // 2))
+
+                # frame counter text
+                label = self._font.render(
+                    f"{self.frame_idx + 1}/{len(self.frames)}", True, (200, 200, 200))
+                self.screen.blit(label, (8, 8))
+            pygame.display.flip()               # swap buffers
+
+        except Exception as e:
+            self.status.set(f"Loop error: {e}")
+        self.after(10, self._loop)
+
+    # ---------------- controls ----------------
+    def _on_fps_change(self, val):
+        try:
+            self.fps = max(1, int(round(float(val))))
+        except (TypeError, ValueError):
+            return
+        self.fps_lbl.config(text=f"{self.fps} fps")
+
+
+# ---------------------------------------------------------------------------
+# 4. MAIN APPLICATION
+# ---------------------------------------------------------------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Basic Image Processing Editor & Animator")
+        self.geometry("1000x720")
+        self.minsize(760, 520)
+
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        nb.add(ImageEditorTab(nb),  text="  Image Editor  ")
+        nb.add(SpriteAnimatorTab(nb), text="  Sprite Animator  ")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        try:
+            pygame.quit()
+        except Exception:
+            pass
+        self.destroy()
+
+
+if __name__ == "__main__":
+    App().mainloop()
